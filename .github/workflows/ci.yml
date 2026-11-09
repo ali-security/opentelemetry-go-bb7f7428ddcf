@@ -1,9 +1,11 @@
 name: ci
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regexp; empty runs the full suite"
+        required: false
+        default: ""
 env:
   # Default version of Go to use by CI workflows. This should be the latest
   # release of Go; developers likely use the latest release in development and
@@ -15,7 +17,12 @@ env:
   DEFAULT_GO_VERSION: "~1.23.0"
 jobs:
   lint:
+    # Disabled on the seal fork: runs no tests. Its `make lint` (go mod tidy) +
+    # check-clean-work-tree would rewrite go.mod `// indirect` markers that the
+    # sealed build keeps byte-identical to the public v0.8.0 module.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -52,6 +59,7 @@ jobs:
         run: make check-clean-work-tree
   test-bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -69,6 +77,7 @@ jobs:
 
   test-race:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -79,10 +88,21 @@ jobs:
           check-latest: true
           cache-dependency-path: "**/go.sum"
       - name: Run tests with race detector
-        run: make test-race
+        run: |
+          status=0
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            (cd sdk/log && go test -v -race -run '${{ inputs.test-filter }}' ./...) 2>&1 | tee "$RUNNER_TEMP/test-race.log" || status=$?
+          else
+            make test-verbose 2>&1 | tee "$RUNNER_TEMP/test-race.log" || status=$?
+          fi
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s}' "$RUNNER_TEMP/test-race.log"
+          echo "SKIPPED TESTS (name: t.Skip reason):"
+          awk '/^=== (RUN|NAME|CONT)/{cur=$3} /^[[:space:]]+[^[:space:]]+_test\.go:[0-9]+:/{sub(/^[[:space:]]+/, ""); msg[cur]=msg[cur] " " $0} /^[[:space:]]*--- SKIP: /{print "  SKIP " $3 ":" msg[$3]}' "$RUNNER_TEMP/test-race.log"
+          exit $status
 
   test-concurrent-safe:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -97,6 +117,7 @@ jobs:
 
   test-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -115,7 +136,11 @@ jobs:
           path: coverage.txt
 
   codecov:
+    # Disabled on the seal fork: coverage upload only (runs no tests) and needs
+    # the upstream repository's Codecov upload token.
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [test-coverage]
     steps:
       - uses: actions/download-artifact@v4
@@ -131,6 +156,7 @@ jobs:
 
   compatibility-test:
     strategy:
+      fail-fast: false
       matrix:
         go-version: ["1.23.0", "~1.22.5"]
         platform:
@@ -138,9 +164,9 @@ jobs:
             arch: "386"
           - os: ubuntu-latest
             arch: amd64
-          - os: otel-linux-arm64
+          - os: ubuntu-22.04-arm
             arch: arm64
-          - os: macos-13
+          - os: macos-latest
             arch: amd64
           - os: macos-latest
             arch: arm64
@@ -148,7 +174,19 @@ jobs:
             arch: "386"
           - os: windows-latest
             arch: amd64
+        # Go 1.22's linker omits LC_UUID; current macos-latest dyld aborts every
+        # test binary it builds ("missing LC_UUID load command"), so macOS runs on 1.23 only.
+        exclude:
+          - go-version: "~1.22.5"
+            platform:
+              os: macos-latest
+              arch: amd64
+          - go-version: "~1.22.5"
+            platform:
+              os: macos-latest
+              arch: arm64
     runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -161,14 +199,81 @@ jobs:
       - name: Run tests
         env:
           GOARCH: ${{ matrix.platform.arch }}
-        run: make test-short
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            cd sdk/log && go test -short -v -run '${{ inputs.test-filter }}' ./...
+          else
+            make test-short
+          fi
 
   test-compatibility:
     runs-on: ubuntu-latest
     needs: [compatibility-test]
     if: always()
+    timeout-minutes: 45
     steps:
       - name: Test if compatibility-test passed
         run: |
           echo ${{ needs.compatibility-test.result }}
           test ${{ needs.compatibility-test.result }} == "success"
+
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.DEFAULT_GO_VERSION }}
+          cache-dependency-path: "**/go.sum"
+      - name: Build module zip
+        run: |
+          MOD_DIR="$GITHUB_WORKSPACE/sdk/log"
+          MOD_PATH=go.opentelemetry.io/otel/sdk/log
+          MOD_VERSION=v0.8.0
+          # proxy.golang.org submodule zips carry the repository-root LICENSE
+          cp "$GITHUB_WORKSPACE/LICENSE" "$MOD_DIR/LICENSE"
+          HELPER="$RUNNER_TEMP/modzip"
+          OUT="$RUNNER_TEMP/modzip-out"
+          mkdir -p "$HELPER" "$OUT"
+          cat > "$HELPER/go.mod" <<'EOF'
+          module example.com/modzip
+
+          go 1.23.0
+          EOF
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[4]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          cd "$HELPER"
+          go get golang.org/x/mod@v0.24.0
+          go run . "$MOD_PATH" "$MOD_VERSION" "$OUT/$MOD_VERSION.zip" "$MOD_DIR"
+          rm "$MOD_DIR/LICENSE"
+          unzip -l "$OUT/$MOD_VERSION.zip"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/modzip-out/v0.8.0.zip
+          if-no-files-found: error
